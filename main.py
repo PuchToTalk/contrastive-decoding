@@ -5,38 +5,71 @@ import transformers as tr
 amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 expert_path = "Qwen/Qwen2.5-1.5B-Instruct"
 
-# Naive first pass: load both models on demand and pick tokens using raw contrastive scores.
+# Advanced pass: contrastive decoding with KV cache, plausibility mask, and top-k pruning.
 tokenizer = tr.AutoTokenizer.from_pretrained(amateur_path)
 amateur = tr.AutoModelForCausalLM.from_pretrained(amateur_path).eval()
 expert = tr.AutoModelForCausalLM.from_pretrained(expert_path).eval()
 
 
-def contrastive_decode(prompt: str, max_new_tokens: int = 40, alpha: float = 0.1) -> str:
-    """Basic contrastive decoding that filters amateur tokens by expert mass."""
+def contrastive_decode(
+    prompt: str,
+    max_new_tokens: int = 40,
+    alpha: float = 0.1,
+    top_k: int = 50,
+) -> str:
+    """Contrastive decoding that reuses KV cache and prunes the candidate set."""
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    device = input_ids.device
+
+    with torch.no_grad():
+        out_e = expert(input_ids, use_cache=True)
+        out_a = amateur(input_ids, use_cache=True)
+
+    past_e, past_a = out_e.past_key_values, out_a.past_key_values
+    logits_e = out_e.logits[:, -1, :]
+    logits_a = out_a.logits[:, -1, :]
+
+    generated: list[int] = []
 
     for _ in range(max_new_tokens):
-        with torch.no_grad():
-            logits_expert = expert(input_ids).logits[:, -1, :]
-            logits_amateur = amateur(input_ids).logits[:, -1, :]
+        logpe = F.log_softmax(logits_e, dim=-1)
+        probs_e = logpe.exp()
 
-        probs_expert = F.softmax(logits_expert, dim=-1)
-        probs_amateur = F.softmax(logits_amateur, dim=-1)
+        threshold = alpha * probs_e.max(dim=-1, keepdim=True).values
+        mask = probs_e >= threshold
 
-        threshold = alpha * probs_expert.max(dim=-1, keepdim=True).values
-        mask = probs_expert >= threshold
+        if top_k > 0:
+            top_k = min(top_k, probs_e.size(-1))
+            _, topk_idx = torch.topk(probs_e, k=top_k)
+            valid_mask = mask[0, topk_idx[0]]
+            cand_idx = topk_idx[0][valid_mask]
+        else:
+            cand_idx = torch.nonzero(mask[0], as_tuple=False).flatten()
 
-        scores = torch.full_like(probs_expert, float("-inf"))
-        scores[mask] = torch.log(probs_expert[mask]) - torch.log(probs_amateur[mask])
+        if cand_idx.numel() == 0:
+            next_token_id = int(torch.argmax(probs_e, dim=-1).item())
+        else:
+            logpa = F.log_softmax(logits_a, dim=-1)
+            scores = logpe[0, cand_idx] - logpa[0, cand_idx]
+            next_token_id = int(cand_idx[torch.argmax(scores)].item())
 
-        next_token_id = torch.argmax(scores, dim=-1, keepdim=True)
-        input_ids = torch.cat([input_ids, next_token_id], dim=1)
-
-        eos_id = tokenizer.eos_token_id
-        if eos_id is not None and next_token_id.item() == eos_id:
+        if next_token_id == tokenizer.eos_token_id:
             break
 
-    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        generated.append(next_token_id)
+
+        next_token = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            out_e = expert(next_token, past_key_values=past_e, use_cache=True)
+            logits_e = out_e.logits[:, -1, :]
+            past_e = out_e.past_key_values
+
+            out_a = amateur(next_token, past_key_values=past_a, use_cache=True)
+            logits_a = out_a.logits[:, -1, :]
+            past_a = out_a.past_key_values
+
+    return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 if __name__ == "__main__":
@@ -55,4 +88,4 @@ if __name__ == "__main__":
     )
 
     print("\n--- Contrastive Decoding Output ---")
-    print(contrastive_decode(prompt, max_new_tokens=40))
+    print(contrastive_decode(prompt, max_new_tokens=40, alpha=0.1, top_k=50))
